@@ -1,0 +1,164 @@
+name: TF Selection
+
+on:
+  # Permit running manually against any branch
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Env to run tests against'
+        type: choice
+        required: true
+        options:
+          - Ue1AccountA
+          - Ue1AccountB
+          - Uw1AccountB
+
+env:
+  tf_version: 1.2.9
+
+permissions:
+      id-token: write
+      contents: read
+      repository-projects: read
+
+jobs:
+
+  populate_envs:
+    name: Populate Envs
+    runs-on: ubuntu-latest # GitHub Hosted Runners
+
+    steps:
+      - name: Populate Envs
+        run: |
+          # Set variables based on run context
+          case ${{ inputs.environment }} in
+          Ue1AccountA)
+              short_region=uw2
+              region=us-west-2
+              account_id=1111111111
+              aws_assume_role_arn=arn:aws:iam::1111111111:role/Role1
+              ;;
+          Ue1AccountB)
+              short_region=ue1
+              region=us-east-1
+              account_id=2222222222
+              aws_assume_role_arn=arn:aws:iam::2222222222:role/Role2
+              ;;
+          Uw1AccountB)
+              short_region=uw1
+              region=us-west-1
+              account_id=2222222222
+              aws_assume_role_arn=arn:aws:iam::2222222222:role/Role2
+              ;;
+          esac
+        
+          # Write envs to file, must write or variable isn't available in other jobs
+          echo "short_region=$short_region" | tee -a $GITHUB_ENV env.vars
+          echo "region=$region" | tee -a $GITHUB_ENV env.vars
+          echo "account_id=$account_id" | tee -a $GITHUB_ENV env.vars
+          echo "aws_assume_role_arn=$aws_assume_role_arn" | tee -a $GITHUB_ENV env.vars
+
+      - name: Cache Envs
+        id: cache-envs
+        uses: actions/upload-artifact@v3
+        with:
+          name: env-cache-${{ github.run_id }}
+          retention-days: 90
+          path: env.vars
+
+  tf_plan:
+    name: TF Plan
+    needs: populate_envs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Download Env Vars
+        id: download-env-vars
+        uses: actions/download-artifact@v3
+        with:
+          name: env-cache-${{ github.run_id }}
+
+      - name: Read Env Vars
+        id: read-env-vars
+        run: |
+          cat env.vars >> $GITHUB_ENV
+
+      - name: AWS Login
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ env.aws_assume_role_arn }}
+          aws-region: ${{ env.region }}
+  
+      - uses: hashicorp/setup-terraform@v2.0.0
+        with:
+         terraform_version: ${{ env.tf_version }}
+      
+      - name: Terraform Init
+        id: init
+        run: terraform init -input=false
+
+      - name: Terraform Refresh
+        id: refresh
+        run: terraform refresh -input=false -var 'region=${{ env.region}}'
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -input=false -refresh=false -var 'region=${{ env.region}}' -out tf.plan
+
+      - name: Cache Files
+        id: cache-files
+        uses: actions/upload-artifact@v3
+        with:
+          name: tf-cache-${{ github.run_id }}
+          retention-days: 90
+          # Grab the entire workspace, but exclude the .terraform folder
+          # It's large and has provider binaries we can easily download in deploy step
+          path: |
+            ${{ github.workspace }}/
+            !${{ github.workspace }}/.terraform
+
+  tf_deploy:
+    name: TF Deploy
+    needs: tf_plan
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Download Cache
+        id: download-cache
+        uses: actions/download-artifact@v3
+        with:
+          name: tf-cache-${{ github.run_id }}
+
+      - name: Download Env Vars
+        id: download-env-vars
+        uses: actions/download-artifact@v3
+        with:
+          name: env-cache-${{ github.run_id }}
+
+      - name: Read Env Vars
+        id: read-env-vars
+        run: |
+          cat env.vars >> $GITHUB_ENV
+          
+      - name: AWS Login
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: ${{ env.aws_assume_role_arn }}
+          aws-region: ${{ env.region }}
+      
+      - uses: hashicorp/setup-terraform@v2.0.0
+        with:
+         terraform_version: ${{ env.tf_version }}
+      
+      # Required in order to download TF providers since we don't cache those due to size
+      - name: Terraform Init
+        id: init
+        run: terraform init -input=false
+
+      - name: Terraform Apply
+        id: apply
+        run: terraform apply -input=false tf.plan
